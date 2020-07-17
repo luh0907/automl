@@ -20,11 +20,11 @@ import numpy as np
 import tensorflow as tf
 
 import dataloader
-import efficientdet_arch as legacy_arch
 import hparams_config
 import utils
 from backbone import backbone_factory
 from backbone import efficientnet_builder
+from keras import fpn_configs
 from keras import postprocess
 from keras import utils_keras
 # pylint: disable=arguments-differ  # fo keras layers.
@@ -580,7 +580,7 @@ class FPNCells(tf.keras.layers.Layer):
     if config.fpn_config:
       self.fpn_config = config.fpn_config
     else:
-      self.fpn_config = legacy_arch.get_fpn_config(config.fpn_name,
+      self.fpn_config = fpn_configs.get_fpn_config(config.fpn_name,
                                                    config.min_level,
                                                    config.max_level,
                                                    config.fpn_weight_method)
@@ -617,14 +617,14 @@ class FPNCell(tf.keras.layers.Layer):
     self.feat_sizes = feat_sizes
     self.config = config
     if config.fpn_config:
-      fpn_config = config.fpn_config
+      self.fpn_config = config.fpn_config
     else:
-      fpn_config = legacy_arch.get_fpn_config(config.fpn_name, config.min_level,
-                                              config.max_level,
-                                              config.fpn_weight_method)
-    self.fpn_config = fpn_config
+      self.fpn_config = fpn_configs.get_fpn_config(config.fpn_name,
+                                                   config.min_level,
+                                                   config.max_level,
+                                                   config.fpn_weight_method)
     self.fnodes = []
-    for i, fnode_cfg in enumerate(fpn_config.nodes):
+    for i, fnode_cfg in enumerate(self.fpn_config.nodes):
       logging.info('fnode %d : %s', i, fnode_cfg)
       fnode = FNode(
           feat_sizes[fnode_cfg['feat_level']]['height'],
@@ -638,7 +638,7 @@ class FPNCell(tf.keras.layers.Layer):
           config.separable_conv,
           config.act_type,
           strategy=config.strategy,
-          weight_method=fpn_config.weight_method,
+          weight_method=self.fpn_config.weight_method,
           data_format=config.data_format,
           name='fnode%d' % i)
       self.fnodes.append(fnode)
@@ -793,6 +793,11 @@ class EfficientDetModel(EfficientDetNet):
   def _postprocess(self, cls_outputs, box_outputs, scales, mode='global'):
     if not mode:
       return cls_outputs, box_outputs
+
+    # TODO(tanmingxing): remove this cast once FP16 works postprocessing.
+    cls_outputs = [tf.cast(i, tf.float32) for i in cls_outputs]
+    box_outputs = [tf.cast(i, tf.float32) for i in box_outputs]
+
     if mode == 'global':
       return postprocess.postprocess_global(self.config.as_dict(), cls_outputs,
                                             box_outputs, scales)
