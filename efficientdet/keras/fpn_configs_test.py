@@ -1,4 +1,3 @@
-# Lint as: python3
 # Copyright 2020 Google Research. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,7 +58,7 @@ class FpnConfigTest(tf.test.TestCase):
     # pyformat: enable
 
   def test_qufpn_dynamic_l3l7(self):
-    p = fpn_configs.qufpn_config(3, 7, None, None)
+    p = fpn_configs.qufpn_config(3, 7, None)
 
     # pyformat: disable
     # pylint: disable=line-too-long

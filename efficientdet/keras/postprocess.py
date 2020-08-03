@@ -1,4 +1,3 @@
-# Lint as: python3
 # Copyright 2020 Google Research. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,17 +64,15 @@ def topk_class_boxes(params, cls_outputs: T,
     # Due to some issues, top_k is currently slow in graph model.
     logging.info('use max_nms_inputs for pre-nms topk.')
     cls_outputs_reshape = tf.reshape(cls_outputs, [batch_size, -1])
-    _, cls_topk_indices = tf.math.top_k(cls_outputs_reshape,
-                                        k=max_nms_inputs,
-                                        sorted=False)
+    _, cls_topk_indices = tf.math.top_k(
+        cls_outputs_reshape, k=max_nms_inputs, sorted=False)
     indices = cls_topk_indices // num_classes
     classes = cls_topk_indices % num_classes
     cls_indices = tf.stack([indices, classes], axis=2)
 
     cls_outputs_topk = tf.gather_nd(cls_outputs, cls_indices, batch_dims=1)
-    box_outputs_topk = tf.gather_nd(box_outputs,
-                                    tf.expand_dims(indices, 2),
-                                    batch_dims=1)
+    box_outputs_topk = tf.gather_nd(
+        box_outputs, tf.expand_dims(indices, 2), batch_dims=1)
   else:
     logging.info('use max_reduce for pre-nms topk.')
     # Keep all anchors, but for each anchor, just keep the max probablity for
@@ -84,8 +81,8 @@ def topk_class_boxes(params, cls_outputs: T,
     num_anchors = cls_outputs.shape[1]
 
     classes = cls_outputs_idx
-    indices = tf.tile(tf.expand_dims(tf.range(num_anchors), axis=0),
-                      [batch_size, 1])
+    indices = tf.tile(
+        tf.expand_dims(tf.range(num_anchors), axis=0), [batch_size, 1])
     cls_outputs_topk = tf.reduce_max(cls_outputs, -1)
     box_outputs_topk = box_outputs
 
@@ -100,8 +97,8 @@ def pre_nms(params, cls_outputs, box_outputs, topk=True):
 
   Args:
     params: a dict of parameters.
-    cls_outputs: a list of tensors for classes, each tensor denotes a level
-      of logits with shape [N, H, W, num_class * num_anchors].
+    cls_outputs: a list of tensors for classes, each tensor denotes a level of
+      logits with shape [N, H, W, num_class * num_anchors].
     box_outputs: a list of tensors for boxes, each tensor ddenotes a level of
       boxes with shape [N, H, W, 4 * num_anchors].
     topk: if True, select topk before nms (mainly to speed up nms).
@@ -138,8 +135,8 @@ def nms(params, boxes: T, scores: T, classes: T,
 
   Args:
     params: a dict of parameters.
-    boxes: a tensor with shape [N, 4], where N is the number of boxes.
-      Box format is [y_min, x_min, y_max, x_max].
+    boxes: a tensor with shape [N, 4], where N is the number of boxes. Box
+      format is [y_min, x_min, y_max, x_max].
     scores: a tensor with shape [N].
     classes: a tensor with shape [N].
     padded: a bool vallue indicating whether the results are padded.
@@ -188,11 +185,11 @@ def postprocess_combined(params, cls_outputs, box_outputs, image_scales=None):
 
   Args:
     params: a dict of parameters.
-    cls_outputs: a list of tensors for classes, each tensor denotes a level
-      of logits with shape [N, H, W, num_class * num_anchors].
+    cls_outputs: a list of tensors for classes, each tensor denotes a level of
+      logits with shape [N, H, W, num_class * num_anchors].
     box_outputs: a list of tensors for boxes, each tensor ddenotes a level of
-      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is
-      [y_min, x_min, y_max, x_man].
+      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is [y_min,
+      x_min, y_max, x_man].
     image_scales: scaling factor or the final image and bounding boxes.
 
   Returns:
@@ -214,10 +211,10 @@ def postprocess_combined(params, cls_outputs, box_outputs, image_scales=None):
           score_threshold=score_thresh,
           clip_boxes=False))
   nms_classes += CLASS_OFFSET
+  nms_boxes = clip_boxes(nms_boxes, params['image_size'])
   if image_scales is not None:
     scales = tf.expand_dims(tf.expand_dims(image_scales, -1), -1)
     nms_boxes = nms_boxes * tf.cast(scales, nms_boxes.dtype)
-  nms_boxes = clip_boxes(nms_boxes, params['image_size'])
   return nms_boxes, nms_scores, nms_classes, nms_valid_len
 
 
@@ -229,11 +226,11 @@ def postprocess_global(params, cls_outputs, box_outputs, image_scales=None):
 
   Args:
     params: a dict of parameters.
-    cls_outputs: a list of tensors for classes, each tensor denotes a level
-      of logits with shape [N, H, W, num_class * num_anchors].
+    cls_outputs: a list of tensors for classes, each tensor denotes a level of
+      logits with shape [N, H, W, num_class * num_anchors].
     box_outputs: a list of tensors for boxes, each tensor ddenotes a level of
-      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is
-      [y_min, x_min, y_max, x_man].
+      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is [y_min,
+      x_min, y_max, x_man].
     image_scales: scaling factor or the final image and bounding boxes.
 
   Returns:
@@ -260,10 +257,10 @@ def postprocess_global(params, cls_outputs, box_outputs, image_scales=None):
   nms_scores_bs = tf.stack(nms_scores_bs)
   nms_classes_bs = tf.stack(nms_classes_bs)
   nms_valid_len_bs = tf.stack(nms_valid_len_bs)
+  nms_boxes_bs = clip_boxes(nms_boxes_bs, params['image_size'])
   if image_scales is not None:
     scales = tf.expand_dims(tf.expand_dims(image_scales, -1), -1)
     nms_boxes_bs = nms_boxes_bs * tf.cast(scales, nms_boxes_bs.dtype)
-  nms_boxes_bs = clip_boxes(nms_boxes_bs, params['image_size'])
   return nms_boxes_bs, nms_scores_bs, nms_classes_bs, nms_valid_len_bs
 
 
@@ -338,11 +335,11 @@ def postprocess_per_class(params, cls_outputs, box_outputs, image_scales=None):
 
   Args:
     params: a dict of parameters.
-    cls_outputs: a list of tensors for classes, each tensor denotes a level
-      of logits with shape [N, H, W, num_class * num_anchors].
+    cls_outputs: a list of tensors for classes, each tensor denotes a level of
+      logits with shape [N, H, W, num_class * num_anchors].
     box_outputs: a list of tensors for boxes, each tensor ddenotes a level of
-      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is
-      [y_min, x_min, y_max, x_man].
+      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is [y_min,
+      x_min, y_max, x_man].
     image_scales: scaling factor or the final image and bounding boxes.
 
   Returns:
@@ -354,20 +351,56 @@ def postprocess_per_class(params, cls_outputs, box_outputs, image_scales=None):
   return per_class_nms(params, boxes, scores, classes, image_scales)
 
 
-def generate_detections(params, cls_outputs, box_outputs, image_scales,
-                        image_ids):
+def generate_detections(params,
+                        cls_outputs,
+                        box_outputs,
+                        image_scales,
+                        image_ids,
+                        flip=False):
   """A legacy interface for generating [id, x, y, w, h, score, class]."""
   nms_boxes_bs, nms_scores_bs, nms_classes_bs, _ = postprocess_per_class(
       params, cls_outputs, box_outputs, image_scales)
 
   image_ids_bs = tf.cast(tf.expand_dims(image_ids, -1), nms_scores_bs.dtype)
-  detections_bs = [
-      image_ids_bs * tf.ones_like(nms_scores_bs),
-      nms_boxes_bs[:, :, 1],
-      nms_boxes_bs[:, :, 0],
-      nms_boxes_bs[:, :, 3] - nms_boxes_bs[:, :, 1],
-      nms_boxes_bs[:, :, 2] - nms_boxes_bs[:, :, 0],
-      nms_scores_bs,
-      nms_classes_bs,
-  ]
+  if flip:
+    _, width = utils.parse_image_size(params['image_size'])
+
+    original_image_widths = tf.expand_dims(image_scales, -1) * width
+    detections_bs = [
+        image_ids_bs * tf.ones_like(nms_scores_bs),
+        # the mirrored location of the left edge is the image width
+        # minus the position of the right edge
+        original_image_widths - nms_boxes_bs[:, :, 3],
+        nms_boxes_bs[:, :, 0],
+        # the mirrored location of the right edge is the image width
+        # minus the position of the left edge
+        original_image_widths - nms_boxes_bs[:, :, 1],
+        nms_boxes_bs[:, :, 2],
+        nms_scores_bs,
+        nms_classes_bs,
+    ]
+  else:
+    detections_bs = [
+        image_ids_bs * tf.ones_like(nms_scores_bs),
+        nms_boxes_bs[:, :, 1],
+        nms_boxes_bs[:, :, 0],
+        nms_boxes_bs[:, :, 3],
+        nms_boxes_bs[:, :, 2],
+        nms_scores_bs,
+        nms_classes_bs,
+    ]
   return tf.stack(detections_bs, axis=-1, name='detnections')
+
+
+def transform_detections(detections):
+  """A transforms detections in [id, x1, y1, x2, y2, score, class] form to [id, x, y, w, h, score, class]."""
+  return tf.stack([
+      detections[:, :, 0],
+      detections[:, :, 1],
+      detections[:, :, 2],
+      detections[:, :, 3] - detections[:, :, 1],
+      detections[:, :, 4] - detections[:, :, 2],
+      detections[:, :, 5],
+      detections[:, :, 6],
+  ],
+                  axis=-1)

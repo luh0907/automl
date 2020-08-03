@@ -1,4 +1,3 @@
-# Lint as: python3
 # Copyright 2020 Google Research. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +21,6 @@ import math
 from typing import Union, Text
 import numpy as np
 import tensorflow as tf
-
 FloatType = Union[tf.Tensor, float, np.float32, np.float64]
 
 

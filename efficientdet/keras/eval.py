@@ -1,4 +1,3 @@
-# Lint as: python3
 # Copyright 2020 Google Research. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +16,7 @@
 from absl import app
 from absl import flags
 from absl import logging
+import tensorflow as tf
 
 import coco_metric
 import dataloader
@@ -25,15 +25,19 @@ import hparams_config
 from keras import anchors
 from keras import efficientdet_keras
 from keras import postprocess
+from keras import wbf
 
 flags.DEFINE_string('val_file_pattern', None,
                     'Glob for eval tfrecords, e.g. coco/val-*.tfrecord.')
-flags.DEFINE_string('val_json_file', None,
-                    'Groudtruth file, e.g. annotations/instances_val2017.json.')
+flags.DEFINE_string(
+    'val_json_file', None,
+    'Groudtruth file, e.g. annotations/instances_val2017.json.')
 flags.DEFINE_string('model_name', 'efficientdet-d0', 'Model name to use.')
-flags.DEFINE_string('checkpoint', None, 'Location of the checkpoint to run.')
+flags.DEFINE_string('model_dir', None, 'Location of the checkpoint to run.')
 flags.DEFINE_integer('batch_size', 8, 'Batch size.')
 flags.DEFINE_string('hparams', '', 'Comma separated k=v pairs or a yaml file')
+flags.DEFINE_boolean('enable_tta', False,
+                     'Use test time augmentation (slower, but more accurate).')
 FLAGS = flags.FLAGS
 
 
@@ -53,22 +57,40 @@ def main(_):
 
   # Network
   model = efficientdet_keras.EfficientDetNet(config=config)
-  model.build((config.batch_size, 512, 512, 3))
-  model.load_weights(FLAGS.checkpoint)
+  model.build((config.batch_size, None, None, 3))
+  model.load_weights(tf.train.latest_checkpoint(FLAGS.model_dir))
 
-  evaluator = coco_metric.EvaluationMetric(
-      filename=config.val_json_file)
+  evaluator = coco_metric.EvaluationMetric(filename=config.val_json_file)
 
   # compute stats for all batches.
   for images, labels in ds:
-    cls_outputs, box_outputs = model(images, training=False)
     config.nms_configs.max_nms_inputs = anchors.MAX_DETECTION_POINTS
+
+    cls_outputs, box_outputs = model(images, training=False)
     detections = postprocess.generate_detections(config, cls_outputs,
                                                  box_outputs,
                                                  labels['image_scales'],
-                                                 labels['source_ids'])
-    evaluator.update_state(labels['groundtruth_data'].numpy(),
-                           detections.numpy())
+                                                 labels['source_ids'], False)
+
+    if FLAGS.enable_tta:
+      images_flipped = tf.image.flip_left_right(images)
+      cls_outputs_flipped, box_outputs_flipped = model(
+          images_flipped, training=False)
+      detections_flipped = postprocess.generate_detections(
+          config, cls_outputs_flipped, box_outputs_flipped,
+          labels['image_scales'], labels['source_ids'], True)
+
+      for d, df in zip(detections, detections_flipped):
+        combined_detections = wbf.ensemble_detections(config,
+                                                      tf.concat([d, df], 0))
+        combined_detections = tf.stack([combined_detections])
+        evaluator.update_state(
+            labels['groundtruth_data'].numpy(),
+            postprocess.transform_detections(combined_detections).numpy())
+    else:
+      evaluator.update_state(
+          labels['groundtruth_data'].numpy(),
+          postprocess.transform_detections(detections).numpy())
 
   # compute the final eval results.
   metric_values = evaluator.result()
@@ -81,6 +103,6 @@ def main(_):
 if __name__ == '__main__':
   flags.mark_flag_as_required('val_file_pattern')
   flags.mark_flag_as_required('val_json_file')
-  flags.mark_flag_as_required('checkpoint')
+  flags.mark_flag_as_required('model_dir')
   logging.set_verbosity(logging.WARNING)
   app.run(main)

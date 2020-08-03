@@ -1,4 +1,3 @@
-# Lint as: python3
 # Copyright 2020 Google Research. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +16,7 @@
 from concurrent import futures
 import math
 import re
+import os
 from absl import logging
 import numpy as np
 import tensorflow as tf
@@ -33,8 +33,7 @@ def update_learning_rate_schedule_parameters(params):
   batch_size = params['batch_size'] * params['num_shards']
   # Learning rate is proportional to the batch size
   params['adjusted_learning_rate'] = (params['learning_rate'] * batch_size / 64)
-  steps_per_epoch = params['num_examples_per_epoch'] / batch_size
-  params['steps_per_epoch'] = steps_per_epoch
+  steps_per_epoch = params['steps_per_epoch']
   params['lr_warmup_step'] = int(params['lr_warmup_epoch'] * steps_per_epoch)
   params['first_lr_drop_step'] = int(params['first_lr_drop_epoch'] *
                                      steps_per_epoch)
@@ -197,11 +196,14 @@ def get_optimizer(params):
 class DisplayCallback(tf.keras.callbacks.Callback):
   """Display inference result callback."""
 
-  def __init__(self, sample_image, update_freq=1):
+  def __init__(self, sample_image, output_dir, update_freq=1):
     super().__init__()
-    self.sample_image = tf.expand_dims(sample_image, axis=0)
+    image_file = tf.io.read_file(sample_image)
+    self.sample_image = tf.expand_dims(
+      tf.image.decode_jpeg(image_file, channels=3), axis=0)
     self.executor = futures.ThreadPoolExecutor(max_workers=1)
     self.update_freq = update_freq
+    self.output_dir = output_dir
 
   def set_model(self, model: tf.keras.Model):
     self.train_model = model
@@ -209,25 +211,29 @@ class DisplayCallback(tf.keras.callbacks.Callback):
       self.model = efficientdet_keras.EfficientDetModel(config=model.config)
     height, width = utils.parse_image_size(model.config.image_size)
     self.model.build((1, height, width, 3))
-    self.file_writer = tf.summary.create_file_writer(model.config.model_dir)
+    self.file_writer = tf.summary.create_file_writer(self.output_dir)
+    self.min_score_thresh = self.model.config.nms_configs['score_thresh'] or 0.4
+    self.max_boxes_to_draw = self.model.config.nms_configs['max_output_size'] or 100
 
   def on_epoch_end(self, epoch, logs=None):
     if epoch % self.update_freq == 0:
-      with self.executor as executor:
-        executor.submit(self.draw_inference, epoch)
+      self.executor.submit(self.draw_inference, epoch)
+
+  @tf.function
+  def inference(self):
+    return self.model(self.sample_image, training=False)
 
   def draw_inference(self, epoch):
     self.model.set_weights(self.train_model.get_weights())
-    boxes, scores, classes, valid_len = (
-        self.model(self.sample_image, training=False))
+    boxes, scores, classes, valid_len = self.inference()
     length = valid_len[0]
     image = inference.visualize_image(
         self.sample_image[0],
         boxes[0].numpy()[:length],
         classes[0].numpy().astype(np.int)[:length],
         scores[0].numpy()[:length],
-        min_score_thresh=self.model.config.nms_configs['score_thresh'],
-        max_boxes_to_draw=self.model.config.nms_configs['max_output_size'])
+        min_score_thresh=self.min_score_thresh,
+        max_boxes_to_draw=self.max_boxes_to_draw)
 
     with self.file_writer.as_default():
       tf.summary.image('Test image', tf.expand_dims(image, axis=0), step=epoch)
@@ -240,8 +246,11 @@ def get_callbacks(params, profile=False):
       params['model_dir'], verbose=1, save_weights_only=True)
   early_stopping = tf.keras.callbacks.EarlyStopping(
       monitor='val_loss', min_delta=0, patience=10, verbose=1)
-  return [tb_callback, ckpt_callback, early_stopping]
-
+  callbacks = [tb_callback, ckpt_callback, early_stopping]
+  if params.get('sample_image', None):
+    callbacks.append(DisplayCallback(params.get('sample_image', None),
+                                     os.path.join(params['model_dir'], 'train')))
+  return callbacks
 
 class FocalLoss(tf.keras.losses.Loss):
   """Compute the focal loss between `logits` and the golden `target` values.
@@ -356,17 +365,13 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
 
   see https://www.tensorflow.org/guide/keras/customizing_what_happens_in_fit
   """
-
-  def freeze_vars(self, pattern):
-    """Freeze variables according to pattern.
-
-    Args:
-      pattern: a reg experession such as ".*(efficientnet|fpn_cells).*".
-    """
-    if pattern:
-      for v in self.trainable_variables:
-        if re.match(pattern, v.name):
-          v.trainable = False
+  def _freeze_vars(self):
+    if self.config.var_freeze_expr:
+      return [
+          v for v in self.trainable_variables
+          if not re.match(self.config.var_freeze_expr, v.name)
+      ]
+    return self.trainable_variables
 
   def _reg_l2_loss(self, weight_decay, regex=r'.*(kernel|weight):0$'):
     """Return regularization l2 loss loss."""
@@ -377,7 +382,7 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
         if var_match.match(v.name)
     ])
 
-  def _detection_loss(self, cls_outputs, box_outputs, labels):
+  def _detection_loss(self, cls_outputs, box_outputs, labels, loss_vals):
     """Computes total detection loss.
 
     Computes total detection loss including box and class loss from all levels.
@@ -389,6 +394,7 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
         num_anchors * 4].
       labels: the dictionary that returned from dataloader that includes
         groundtruth targets.
+      loss_vals: A dict of loss values.
 
     Returns:
       total_loss: an integer tensor representing total loss reducing from
@@ -456,6 +462,7 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
       box_iou_loss_layer = self.loss['box_iou_loss']
       box_iou_loss = box_iou_loss_layer([num_positives_sum, box_targets],
                                         box_outputs)
+      loss_vals['box_iou_loss'] = box_iou_loss
     else:
       box_iou_loss = 0
 
@@ -464,6 +471,9 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
     total_loss = (
         cls_loss + self.config.box_loss_weight * box_loss +
         self.config.iou_loss_weight * box_iou_loss)
+    loss_vals['det_loss'] = total_loss
+    loss_vals['cls_loss'] = cls_loss
+    loss_vals['box_loss'] = box_loss
     return total_loss, cls_loss, box_loss, box_iou_loss
 
   def train_step(self, data):
@@ -481,17 +491,31 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
     """
     images, labels = data
     with tf.GradientTape() as tape:
-      cls_outputs, box_outputs = self(images, training=True)
-      det_loss, cls_loss, box_loss, box_iou_loss = (
-          self._detection_loss(cls_outputs, box_outputs, labels))
+      if len(self.config.heads) == 2:
+        cls_outputs, box_outputs, seg_outputs = self(images, training=True)
+      elif 'object_detection' in self.config.heads:
+        cls_outputs, box_outputs = self(images, training=True)
+      elif 'segmentation' in self.config.heads:
+        seg_outputs = self(images, training=True)
       reg_l2loss = self._reg_l2_loss(self.config.weight_decay)
-      total_loss = det_loss + reg_l2loss
+      total_loss = reg_l2loss
+      loss_vals = {}
+      if 'object_detection' in self.config.heads:
+        det_loss = (
+            self._detection_loss(cls_outputs, box_outputs, labels, loss_vals))
+        total_loss += det_loss
+      if 'segmentation' in self.config.heads:
+        seg_loss_layer = self.loss['seg_loss']
+        seg_loss = seg_loss_layer(seg_outputs, labels['image_masks'])
+        total_loss += seg_loss
+        loss_vals['seg_loss'] = seg_loss
       if isinstance(self.optimizer,
                     tf.keras.mixed_precision.experimental.LossScaleOptimizer):
         scaled_loss = self.optimizer.get_scaled_loss(total_loss)
       else:
         scaled_loss = total_loss
-    trainable_vars = self.trainable_variables
+    loss_vals['loss'] = total_loss
+    trainable_vars = self._freeze_vars()
     scaled_gradients = tape.gradient(scaled_loss, trainable_vars)
     if isinstance(self.optimizer,
                   tf.keras.mixed_precision.experimental.LossScaleOptimizer):
@@ -501,13 +525,9 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
     if self.config.clip_gradients_norm > 0:
       gradients, gnorm = tf.clip_by_global_norm(gradients,
                                                 self.config.clip_gradients_norm)
+      loss_vals['gnorm'] = gnorm
     self.optimizer.apply_gradients(zip(gradients, trainable_vars))
-    return {'loss': total_loss,
-            'det_loss': det_loss,
-            'cls_loss': cls_loss,
-            'box_loss': box_loss,
-            'box_iou_loss': box_iou_loss,
-            'gnorm': gnorm}
+    return loss_vals
 
   def test_step(self, data):
     """Test step.
@@ -523,15 +543,23 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
       A dict record loss info.
     """
     images, labels = data
-    cls_outputs, box_outputs = self(images, training=False)
-    det_loss, cls_loss, box_loss, box_iou_loss = (
-        self._detection_loss(cls_outputs, box_outputs, labels))
+    if len(self.config.heads) == 2:
+      cls_outputs, box_outputs, seg_outputs = self(images, training=True)
+    elif 'object_detection' in self.config.heads:
+      cls_outputs, box_outputs = self(images, training=True)
+    elif 'segmentation' in self.config.heads:
+      seg_outputs = self(images, training=True)
     reg_l2loss = self._reg_l2_loss(self.config.weight_decay)
-    total_loss = det_loss + reg_l2loss
-    return {
-        'loss': total_loss,
-        'det_loss': det_loss,
-        'cls_loss': cls_loss,
-        'box_loss': box_loss,
-        'box_iou_loss': box_iou_loss
-    }
+    total_loss = reg_l2loss
+    loss_vals = {}
+    if 'object_detection' in self.config.heads:
+      det_loss = (
+          self._detection_loss(cls_outputs, box_outputs, labels, loss_vals))
+      total_loss += det_loss
+    if 'segmentation' in self.config.heads:
+      seg_loss_layer = self.loss['seg_loss']
+      seg_loss = seg_loss_layer(seg_outputs, labels['image_masks'])
+      total_loss += seg_loss
+      loss_vals['seg_loss'] = seg_loss
+    loss_vals['loss'] = total_loss
+    return loss_vals

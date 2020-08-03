@@ -1,4 +1,3 @@
-# Lint as: python3
 # Copyright 2020 Google Research. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -221,9 +220,8 @@ class OpAfterCombine(tf.keras.layers.Layer):
       new_node = utils.activation_fn(new_node, self.act_type)
     new_node = self.conv_op(new_node)
     new_node = self.bn(new_node, training=training)
-    act_type = None if not self.conv_bn_act_pattern else self.act_type
-    if act_type:
-      new_node = utils.activation_fn(new_node, act_type)
+    if self.conv_bn_act_pattern:
+      new_node = utils.activation_fn(new_node, self.act_type)
     return new_node
 
 
@@ -537,7 +535,6 @@ class BoxNet(tf.keras.layers.Layer):
           bias_initializer=tf.zeros_initializer(),
           padding='same',
           name='box-predict')
-
     else:
       self.boxes = tf.keras.layers.Conv2D(
           filters=4 * self.num_anchors,
@@ -549,7 +546,7 @@ class BoxNet(tf.keras.layers.Layer):
           padding='same',
           name='box-predict')
 
-  def call(self, inputs, training, **kwargs):
+  def call(self, inputs, training):
     """Call boxnet."""
     box_outputs = []
     for level_id in range(0, self.max_level - self.min_level + 1):
@@ -567,6 +564,69 @@ class BoxNet(tf.keras.layers.Layer):
       box_outputs.append(self.boxes(image))
 
     return box_outputs
+
+
+class SegmentationHead(tf.keras.layers.Layer):
+  """Keras layer for semantic segmentation head."""
+
+  def __init__(self,
+               num_classes,
+               num_filters,
+               min_level,
+               max_level,
+               data_format,
+               is_training_bn,
+               act_type,
+               strategy,
+               **kwargs):
+    """Initialize SegmentationHead.
+
+    Args:
+      num_classes: number of classes.
+      num_filters: number of filters for "intermediate" layers.
+      min_level: minimum level for features.
+      max_level: maximum level for features.
+      data_format: string of 'channel_first' or 'channels_last'.
+      is_training_bn: True if we train the BatchNorm.
+      act_type: String of the activation used.
+      strategy: string to specify training strategy for TPU/GPU/CPU.
+      **kwargs: other parameters.
+    """
+    super().__init__(**kwargs)
+    self.act_type = act_type
+    self.con2d_ts = []
+    self.con2d_t_bns = []
+    for _ in range(max_level - min_level):
+      self.con2d_ts.append(
+          tf.keras.layers.Conv2DTranspose(
+              num_filters,
+              3,
+              strides=2,
+              padding='same',
+              data_format=data_format,
+              use_bias=False))
+      self.con2d_t_bns.append(
+          utils_keras.build_batch_norm(
+              is_training_bn=is_training_bn,
+              data_format=data_format,
+              strategy=strategy,
+              name='bn'))
+    self.head_transpose = tf.keras.layers.Conv2DTranspose(
+        num_classes, 3, strides=2, padding='same')
+
+  def call(self, feats, training):
+    x = feats[-1]
+    skips = list(reversed(feats[:-1]))
+
+    for con2d_t, con2d_t_bn, skip in zip(self.con2d_ts, self.con2d_t_bns,
+                                         skips):
+      x = con2d_t(x)
+      x = con2d_t_bn(x, training)
+      x = utils.activation_fn(x, self.act_type)
+      x = tf.concat([x, skip], axis=-1)
+
+    # This is the last layer of the model
+    return self.head_transpose(x)  # 64x64 -> 128x128
 
 
 class FPNCells(tf.keras.layers.Layer):
@@ -602,9 +662,6 @@ class FPNCells(tf.keras.layers.Layer):
           if fnode['feat_level'] == level:
             feats.append(cell_feats[-1 - i])
             break
-
-      utils.verify_feats_size(feats, self.feat_sizes, min_level, max_level,
-                              self.config.data_format)
 
     return feats
 
@@ -701,32 +758,45 @@ class EfficientDetNet(tf.keras.Model):
     # class/box output prediction network.
     num_anchors = len(config.aspect_ratios) * config.num_scales
     num_filters = config.fpn_num_filters
-    self.class_net = ClassNet(
-        num_classes=config.num_classes,
-        num_anchors=num_anchors,
-        num_filters=num_filters,
-        min_level=config.min_level,
-        max_level=config.max_level,
-        is_training_bn=config.is_training_bn,
-        act_type=config.act_type,
-        repeats=config.box_class_repeats,
-        separable_conv=config.separable_conv,
-        survival_prob=config.survival_prob,
-        strategy=config.strategy,
-        data_format=config.data_format)
+    for head in config.heads:
+      if head == 'object_detection':
+        self.class_net = ClassNet(
+            num_classes=config.num_classes,
+            num_anchors=num_anchors,
+            num_filters=num_filters,
+            min_level=config.min_level,
+            max_level=config.max_level,
+            is_training_bn=config.is_training_bn,
+            act_type=config.act_type,
+            repeats=config.box_class_repeats,
+            separable_conv=config.separable_conv,
+            survival_prob=config.survival_prob,
+            strategy=config.strategy,
+            data_format=config.data_format)
 
-    self.box_net = BoxNet(
-        num_anchors=num_anchors,
-        num_filters=num_filters,
-        min_level=config.min_level,
-        max_level=config.max_level,
-        is_training_bn=config.is_training_bn,
-        act_type=config.act_type,
-        repeats=config.box_class_repeats,
-        separable_conv=config.separable_conv,
-        survival_prob=config.survival_prob,
-        strategy=config.strategy,
-        data_format=config.data_format)
+        self.box_net = BoxNet(
+            num_anchors=num_anchors,
+            num_filters=num_filters,
+            min_level=config.min_level,
+            max_level=config.max_level,
+            is_training_bn=config.is_training_bn,
+            act_type=config.act_type,
+            repeats=config.box_class_repeats,
+            separable_conv=config.separable_conv,
+            survival_prob=config.survival_prob,
+            strategy=config.strategy,
+            data_format=config.data_format)
+
+      if head == 'segmentation':
+        self.seg_head = SegmentationHead(
+            num_classes=config.seg_num_classes,
+            num_filters=num_filters,
+            min_level=config.min_level,
+            max_level=config.max_level,
+            is_training_bn=config.is_training_bn,
+            act_type=config.act_type,
+            strategy=config.strategy,
+            data_format=config.data_format)
 
   def _init_set_name(self, name, zero_based=True):
     """A hack to allow empty model name for legacy checkpoint compitability."""
@@ -756,11 +826,16 @@ class EfficientDetNet(tf.keras.Model):
     # call feature network.
     feats = self.fpn_cells(feats, training)
 
-    # call class/box output network.
-    class_outputs = self.class_net(feats, training)
-    box_outputs = self.box_net(feats, training)
-
-    return class_outputs, box_outputs
+    # call class/box/seg output network.
+    outputs = []
+    if 'object_detection' in config.heads:
+      class_outputs = self.class_net(feats, training)
+      box_outputs = self.box_net(feats, training)
+      outputs.extend([class_outputs, box_outputs])
+    if 'segmentation' in config.heads:
+      seg_outputs = self.seg_head(feats, training)
+      outputs.append(seg_outputs)
+    return tuple(outputs)
 
 
 class EfficientDetModel(EfficientDetNet):
@@ -776,19 +851,17 @@ class EfficientDetModel(EfficientDetNet):
       # We only support inference for now.
       raise ValueError('preprocessing must be infer or empty')
 
-    scales, images = [], []
-    if isinstance(raw_images, tf.Tensor):
-      batch_size = raw_images.shape[0]
-    else:
-      batch_size = len(raw_images)
-    for i in range(batch_size):
+    def map_fn(image):
       input_processor = dataloader.DetectionInputProcessor(
-          raw_images[i], image_size)
+          image, image_size)
       input_processor.normalize_image()
       input_processor.set_scale_factors_to_output_size()
-      images.append(input_processor.resize_and_crop_image())
-      scales.append(input_processor.image_scale_to_original)
-    return tf.stack(images), tf.stack(scales)
+      image = input_processor.resize_and_crop_image()
+      image_scale = input_processor.image_scale_to_original
+      return image, image_scale
+
+    return tf.map_fn(
+        map_fn, raw_images, dtype=(tf.float32, tf.float32), back_prop=False)
 
   def _postprocess(self, cls_outputs, box_outputs, scales, mode='global'):
     if not mode:
@@ -823,6 +896,11 @@ class EfficientDetModel(EfficientDetNet):
     # preprocess.
     inputs, scales = self._preprocessing(inputs, config.image_size, pre_mode)
     # network.
-    cls_outputs, box_outputs = super().call(inputs, training)
-    # postprocess.
-    return self._postprocess(cls_outputs, box_outputs, scales, post_mode)
+    outputs = super().call(inputs, training)
+
+    if 'object_detection' in config.heads and post_mode:
+      # postprocess for detection
+      det_outputs = self._postprocess(outputs[0], outputs[1], scales, post_mode)
+      outputs = det_outputs + outputs[2:]
+
+    return outputs
